@@ -46,7 +46,9 @@ jobs:
 
       - name: Install tools
         run: |
-          pip install yt-dlp
+          python -m pip install -U pip
+          python -m pip install -U yt-dlp
+          yt-dlp -U
           sudo apt-get update
           sudo apt-get install -y bc rar
 
