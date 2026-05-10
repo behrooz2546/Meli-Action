@@ -110,7 +110,7 @@ jobs:
           FILENAME="${{ steps.download.outputs.filename }}"
           SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
           SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
+          THRESHOLD_MB=49
 
           cd "$FOLDER"
 
@@ -120,7 +120,7 @@ jobs:
             RANDOM_HEX=$(openssl rand -hex 3)
             ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
             echo "Archive base name: ${ARCHIVE_NAME}"
-            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+            rar a -v45m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
             rm "$FILENAME"   # Remove original file after successful split
             echo "split_done=true" >> $GITHUB_OUTPUT
             echo "Split completed. Parts created:"
