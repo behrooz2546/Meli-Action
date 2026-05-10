@@ -36,6 +36,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -48,20 +50,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc rar
 
-      - name: Download video (retry)
+      - name: Download video (retry up to 5 times)
         id: download
         shell: bash
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
+
           mkdir -p "$FOLDER"
+
           touch marker
 
           MAX_RETRIES=5
-          RETRY=0
+          RETRY_COUNT=0
           SUCCESS=false
 
-          while [ $RETRY -lt $MAX_RETRIES ]; do
-            echo "Attempt $((RETRY+1))/$MAX_RETRIES"
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+
+            echo "Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
 
             yt-dlp \
               --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
@@ -69,24 +74,36 @@ jobs:
               --merge-output-format mp4 \
               --retries 3 \
               --fragment-retries 10 \
+              --no-check-certificate \
               --geo-bypass \
+              --no-color \
               --ignore-errors \
+              --newline \
               "${{ github.event.inputs.url }}" && {
 
-              NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
+                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
 
-              if [ -n "$NEW_FILE" ]; then
-                SUCCESS=true
-                break
-              fi
-            }
+                if [ -n "$NEW_FILE" ]; then
+                  echo "Download succeeded: $NEW_FILE"
+                  SUCCESS=true
+                  break
+                else
+                  echo "No new file found. Retrying..."
+                fi
+              } || {
+                echo "Download failed with exit code $?"
+              }
 
-            RETRY=$((RETRY+1))
-            sleep 5
+            RETRY_COUNT=$((RETRY_COUNT+1))
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "Waiting 5 seconds before retry..."
+              sleep 5
+            fi
           done
 
           if [ "$SUCCESS" = false ]; then
-            echo "Download failed"
+            echo "All download attempts failed."
             exit 1
           fi
 
@@ -96,63 +113,103 @@ jobs:
           echo "filename=$FILENAME" >> $GITHUB_OUTPUT
           echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
 
-      - name: Split file if needed
+      - name: Split file if larger than 49 MB
+        id: split
         shell: bash
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
-          FILE="${{ steps.download.outputs.filename }}"
-          SIZE="${{ steps.download.outputs.size_bytes }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
 
-          SIZE_MB=$(echo "$SIZE / 1048576" | bc)
-          THRESHOLD=49
+          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
+          THRESHOLD_MB=49
 
           cd "$FOLDER"
 
-          if (( $(echo "$SIZE_MB > $THRESHOLD" | bc -l) )); then
-            echo "Splitting file..."
+          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
 
-            RAND=$(openssl rand -hex 3)
-            NAME="${{ github.event.inputs.archive_name }}_$RAND"
+            echo "File exceeds threshold. Splitting into RAR parts..."
 
-            rar a -v45m -m5 "${NAME}.rar" "$FILE"
+            RANDOM_HEX=$(openssl rand -hex 3)
+            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
 
-            rm "$FILE"
+            rar a -v45m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+
+            rm "$FILENAME"
+
+          else
+            echo "File size is below threshold. Keeping original file."
           fi
 
-      - name: Commit & push files
+      - name: Commit and push downloaded files
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add "${{ github.event.inputs.output_folder }}/"
-          git commit -m "Add downloaded files" || echo "Nothing to commit"
+
+          git commit -m "Add downloaded video files" || echo "Nothing to commit"
+
           git push
 
-  summary-links:
-    needs: download-and-maybe-split
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Show links in GitHub Actions Summary
+      - name: Generate links-video.txt after push
         shell: bash
         run: |
           REPO="${{ github.repository }}"
           BRANCH="${{ github.ref_name }}"
           FOLDER="${{ github.event.inputs.output_folder }}"
 
+          # ensure latest pushed state
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+
+          FILES=$(find "$FOLDER" -type f | sort)
+
+          # get clean base filename
+          FIRST_FILE=$(echo "$FILES" | head -n 1)
+          BASE_NAME=$(basename "$FIRST_FILE")
+
+          BASE_NAME=$(echo "$BASE_NAME" | sed -E 's/(\.part[0-9]+\.rar|\.rar|\.mp4|\.mkv|\.webm|\.mov)$//')
+
+          OUTPUT_FILE="links-${BASE_NAME}.txt"
+
+          echo "Creating $OUTPUT_FILE"
+
+          echo "Raw download links:" > "$OUTPUT_FILE"
+          echo "" >> "$OUTPUT_FILE"
+
           echo "## 📥 Download Links" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          FILES=$(find "$FOLDER" -type f)
-
           for FILE in $FILES; do
-            RAW="https://raw.githubusercontent.com/$REPO/$BRANCH/$FILE"
-            echo "- $RAW" >> $GITHUB_STEP_SUMMARY
+            RAW_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/$FILE"
+
+            # save into txt file
+            echo "$RAW_URL" >> "$OUTPUT_FILE"
+
+            # print in logs
+            echo "$RAW_URL"
+
+            # clickable links in summary
+            echo "- [$FILE]($RAW_URL)" >> $GITHUB_STEP_SUMMARY
           done
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Done" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Links file generated: $OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "Generated file:"
+          cat "$OUTPUT_FILE"
+
+      - name: Commit links file
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add links-*.txt
+
+          git commit -m "Add generated links file" || echo "Nothing to commit"
+
+          git push
